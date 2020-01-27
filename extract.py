@@ -302,4 +302,4 @@ if __name__ == '__main__':
         chains_with_sim[img_path] = new_cs
 
     with open('chains_mean_Rbert_tf.dict', 'wb') as f:
-        pickle.dump(caption_reprs, file=f)
+        pickle.dump(chains_with_sim, file=f)
