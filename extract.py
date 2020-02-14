@@ -11,6 +11,7 @@ from copy import deepcopy
 from collections import defaultdict, Counter
 from transformers import AutoModel, AutoTokenizer
 from nltk.corpus import stopwords
+from nltk.translate.meteor_score import single_meteor_score as meteor
 
 
 def load_logs(log_repository, data_path):
@@ -123,63 +124,11 @@ def stopwords_filter(text):
     return ' '.join(filtered)
 
 
-def old_chains_from_game_logs(data_path='', logs_folder='logs'):
-    logs = load_logs(logs_folder, data_path)
-    dataset = collect_dataset(logs)
-
-    F = ['Game_ID', 'Round_Nr', 'Round_Common', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text']
-    f2i = {field: i for i, field in enumerate(F)}
-
-    chains = defaultdict(list)
-    buffer = []
-    recognised_as_common = {}
-    tot_messages = 0
-    current_game_id = -1
-    prev_row_type = ''
-    prev_img_id = ''
-
-    for index, row in tqdm(dataset.iterrows(), total=len(dataset)):
-
-        # collect fields of interest
-        fields = {field: row[field] for field in F}
-
-        # flush buffer when a new game starts
-        if fields['Game_ID'] != current_game_id:
-            buffer = []
-            recognised_as_common = {}
-            current_game_id = fields['Game_ID']
-            prev_row_type = ''
-            prev_img_id = ''
-
-        if fields['Message_Type'] == 'selection':
-            # parse selection: <com>/<dif> + img_id_str
-            _, selection, img_path = fields['Message_Text'].split(' ')
-
-            if selection == '<com>' and img_path in fields['Round_Common'] and img_path not in recognised_as_common:
-                recognised_as_common.append(img_path)
-                chains[img_path].append(buffer)
-                prev_img_id = img_path
-
-            elif img_path in recognised_as_common and img_path != prev_img_id:
-                chains[img_path][-1] += buffer
-                prev_img_id = img_path
-
-        elif fields['Message_Type'] == 'text':
-            tot_messages += 1
-            if prev_row_type == 'selection':
-                buffer = []
-            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text']))
-
-        prev_row_type = fields['Message_Type']
-
-    return chains
-
-
 def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
     logs = load_logs(logs_folder, data_path)
     dataset = collect_dataset(logs)
 
-    F = ['Game_ID', 'Round_Nr', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text', 'Round_Common']
+    F = ['Game_ID', 'Round_Nr', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text', 'Round_Common', 'Round_Images_A', 'Round_Images_B']
 
     chains = defaultdict(list)
     buffer = []
@@ -215,7 +164,8 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
         # Within round: store utterance
         if fields['Message_Type'] == 'text':
             tot_messages += 1
-            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text']))
+            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
+            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text'], visual_context))
 
         if fields['Message_Type'] == 'selection':
             # parse selection: <com>/<dif> + img_id_str
@@ -318,7 +268,31 @@ def get_best_description(utterances):
     return tuple(zip(description, description_as_bow, input_tfs))
 
 
-def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stopwords, descriptions_as_captions):
+def vg_score(text, img_path, vg_attributes, vg_relations, visual_context):
+    target_attributes = vg_attributes[img_path]
+    target_relations = vg_relations[img_path]
+
+    visual_context -= {img_path}
+
+    confounding_attributes = set()
+    confounding_relations = set()
+    for path in visual_context:
+        confounding_attributes |= vg_attributes[path]
+        confounding_relations |= vg_relations[path]
+
+    discriminative_attributes = target_attributes - confounding_attributes
+    discriminative_relations = target_relations - confounding_relations
+
+    meteor_att = meteor(' '.join(discriminative_attributes), text)
+    meteor_rel = meteor(' '.join(discriminative_relations), text)
+
+    return meteor_att, meteor_rel
+
+
+def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stopwords, descriptions_as_captions, vg_attributes=None, vg_relations=None):
+
+    use_vg = (vg_attributes is not None) and (vg_relations is not None)
+
     _caption_reprs = deepcopy(caption_reprs)
     chains_with_scores = defaultdict(list)
 
@@ -336,7 +310,7 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
             utterances_in_current_round = []
 
         new_c = []
-        for game_id, round_nr, speaker, text in chains[img_path]:
+        for game_id, round_nr, speaker, text, vis_context in chains[img_path]:
 
             if descriptions_as_captions and game_id != current_game:
                 _caption_reprs = deepcopy(caption_reprs)
@@ -354,10 +328,15 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 continue
 
             # compute recall using BERTScore (Zhang et al. 2019)
-            R = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
+            score = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
+
+            if use_vg:
+                # compute METEOR using Visual Genome annotations
+                meteor_att, meteor_rel = vg_score(text, img_path, vg_attributes, vg_relations, vis_context)
+                score += meteor_att + meteor_rel
 
             if descriptions_as_captions:
-                utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, R))
+                utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, score))
 
             # base case - first iteration
             if descriptions_as_captions and current_round == -1:
@@ -372,7 +351,7 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 utterances_in_current_round = []
 
             # store current utterance with score
-            new_c.append((game_id, round_nr, speaker, text, R))
+            new_c.append((game_id, round_nr, speaker, text, score))
 
         # store current image's chains_3feb (with scores)
         chains_with_scores[img_path] += new_c
@@ -410,6 +389,7 @@ def main(output_path,
          tf_weighting,
          remove_stopwords,
          descriptions_as_captions,
+         use_vg,
          store_caption_representations=False,
          load_chains=True,
          load_captions=True,
@@ -454,11 +434,22 @@ def main(output_path,
     if not tf_weighting:
         tf_counter = None
 
+    if use_vg:
+        with open('visual_genome/attributes.dict', 'wb') as f:
+            vg_attributes = pickle.load(f)
+
+        with open('visual_genome/relations.dict', 'wb') as f:
+            vg_relations = pickle.load(f)
+    else:
+        vg_attributes, vg_relations = None, None
+
     # Score each utterance in the chains by its similarity to the respective reference captions
     chains_with_scores = chains_with_utterance_scores(
         image_paths, all_chains, caption_reprs,
         remove_stopwords=remove_stopwords,
-        descriptions_as_captions=descriptions_as_captions
+        descriptions_as_captions=descriptions_as_captions,
+        vg_attributes=vg_attributes,
+        vg_relations=vg_relations
     )
 
     # Store chains with scores
@@ -484,8 +475,8 @@ if __name__ == '__main__':
     SEED = 0
     out_file_id = 3
 
-    # main('chains_test', whole_round=False, tf_weighting=False, remove_stopwords=False,
-    #      descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
+    main('chains_test', whole_round=False, tf_weighting=False, remove_stopwords=False,
+         descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
 
     main('chains_test_descr', whole_round=False, tf_weighting=False, remove_stopwords=False,
          descriptions_as_captions=True, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
@@ -648,3 +639,55 @@ if __name__ == '__main__':
 #         chains_with_scores[img_path] = new_cs
 #
 #     return chains_with_scores
+#
+#
+# def old_chains_from_game_logs(data_path='', logs_folder='logs'):
+#     logs = load_logs(logs_folder, data_path)
+#     dataset = collect_dataset(logs)
+#
+#     F = ['Game_ID', 'Round_Nr', 'Round_Common', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text']
+#     f2i = {field: i for i, field in enumerate(F)}
+#
+#     chains = defaultdict(list)
+#     buffer = []
+#     recognised_as_common = {}
+#     tot_messages = 0
+#     current_game_id = -1
+#     prev_row_type = ''
+#     prev_img_id = ''
+#
+#     for index, row in tqdm(dataset.iterrows(), total=len(dataset)):
+#
+#         # collect fields of interest
+#         fields = {field: row[field] for field in F}
+#
+#         # flush buffer when a new game starts
+#         if fields['Game_ID'] != current_game_id:
+#             buffer = []
+#             recognised_as_common = {}
+#             current_game_id = fields['Game_ID']
+#             prev_row_type = ''
+#             prev_img_id = ''
+#
+#         if fields['Message_Type'] == 'selection':
+#             # parse selection: <com>/<dif> + img_id_str
+#             _, selection, img_path = fields['Message_Text'].split(' ')
+#
+#             if selection == '<com>' and img_path in fields['Round_Common'] and img_path not in recognised_as_common:
+#                 recognised_as_common.append(img_path)
+#                 chains[img_path].append(buffer)
+#                 prev_img_id = img_path
+#
+#             elif img_path in recognised_as_common and img_path != prev_img_id:
+#                 chains[img_path][-1] += buffer
+#                 prev_img_id = img_path
+#
+#         elif fields['Message_Type'] == 'text':
+#             tot_messages += 1
+#             if prev_row_type == 'selection':
+#                 buffer = []
+#             buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text']))
+#
+#         prev_row_type = fields['Message_Type']
+#
+#     return chains
