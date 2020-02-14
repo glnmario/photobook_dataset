@@ -283,8 +283,8 @@ def vg_score(text, img_path, vg_attributes, vg_relations, visual_context):
     discriminative_attributes = target_attributes - confounding_attributes
     discriminative_relations = target_relations - confounding_relations
 
-    meteor_att = meteor(' '.join(discriminative_attributes), text)
-    meteor_rel = meteor(' '.join(discriminative_relations), text)
+    meteor_att = meteor(' '.join(discriminative_attributes), text, gamma=0)
+    meteor_rel = meteor(' '.join(discriminative_relations), text, gamma=0)
 
     return meteor_att, meteor_rel
 
@@ -397,6 +397,15 @@ def main(output_path,
          seed=0):
     random.seed(a=seed)
 
+    if use_vg:
+        with open('visual_genome/attributes.dict', 'rb') as f:
+            vg_attributes = pickle.load(f)
+
+        with open('visual_genome/relationships.dict', 'rb') as f:
+            vg_relations = pickle.load(f)
+    else:
+        vg_attributes, vg_relations = None, None
+
     if load_chains:
         with open('new_chains.dict', 'rb') as f:
             all_chains = pickle.load(file=f)
@@ -434,14 +443,6 @@ def main(output_path,
     if not tf_weighting:
         tf_counter = None
 
-    if use_vg:
-        with open('visual_genome/attributes.dict', 'wb') as f:
-            vg_attributes = pickle.load(f)
-
-        with open('visual_genome/relations.dict', 'wb') as f:
-            vg_relations = pickle.load(f)
-    else:
-        vg_attributes, vg_relations = None, None
 
     # Score each utterance in the chains by its similarity to the respective reference captions
     chains_with_scores = chains_with_utterance_scores(
@@ -475,11 +476,11 @@ if __name__ == '__main__':
     SEED = 0
     out_file_id = 3
 
-    main('chains_test', whole_round=False, tf_weighting=False, remove_stopwords=False,
-         descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
+    main('chains_test_novg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=False,
+         descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
 
-    main('chains_test_descr', whole_round=False, tf_weighting=False, remove_stopwords=False,
-         descriptions_as_captions=True, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
+    main('chains_test_vg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=True,
+         descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
 
     # for whole in [False, True]:
     #
