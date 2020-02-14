@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from processor import Log
+from copy import deepcopy
 from collections import defaultdict, Counter
 from transformers import AutoModel, AutoTokenizer
 from nltk.corpus import stopwords
@@ -99,6 +100,8 @@ def bert_recall(reference, candidate, tf):
 
     if tf:
         R /= tf_sum
+    else:
+        R /= len(reference)
 
     return R
 
@@ -300,77 +303,79 @@ def preprocess_captions(image_paths, captions, remove_stopwords):
     return caption_representations, tf_counter
 
 
-def is_description(utterance):
-    _, _, _, recall = utterance
-    return recall > 6
+def get_best_description(utterances):
+    best_description = ('', [], None, 0)
+    for utterance in utterances:
+        if utterance[3] >= best_description[3]:
+            best_description = utterance
+
+    description = best_description[0]
+    description_as_bow = best_description[2]
+
+    description_tok_ids = best_description[1]
+    input_tfs = [-1 for w in description_tok_ids]  # use dummy tf values
+
+    return tuple(zip(description, description_as_bow, input_tfs))
 
 
 def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stopwords, descriptions_as_captions):
-    _caption_reprs = {k: v for (k, v) in caption_reprs.items()}
+    _caption_reprs = deepcopy(caption_reprs)
     chains_with_scores = defaultdict(list)
 
     for img_path in tqdm(image_paths):
 
+        # if img_path != 'chair_couch/COCO_train2014_000000399122.jpg':
+            # continue
+
         # get image id as a string for compatibility
         img_id_str = img_path.split('/')[-1]
 
-        new_cs = []
-        for c in chains[img_path]:
-            new_c = []
+        if descriptions_as_captions:
+            current_round = -1
+            current_game = -1
+            utterances_in_current_round = []
+
+        new_c = []
+        for game_id, round_nr, speaker, text in chains[img_path]:
+
+            if descriptions_as_captions and game_id != current_game:
+                _caption_reprs = deepcopy(caption_reprs)
+                current_game = game_id
+                current_round = round_nr
+
+            if remove_stopwords:
+                text = stopwords_filter(text)
+
+            try:
+                # convert text to a bag-of-contextualised-words representations
+                input_ids, utt_bow = text_to_bow(text, remove_stopwords, return_ids=True)
+            except TypeError:
+                # as a result of stopwords filtering, the text may be empty
+                continue
+
+            # compute recall using BERTScore (Zhang et al. 2019)
+            R = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
 
             if descriptions_as_captions:
-                current_round = -1
-                current_game = -1
+                utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, R))
+
+            # base case - first iteration
+            if descriptions_as_captions and current_round == -1:
+                current_round = round_nr
+
+            # new round
+            if descriptions_as_captions and current_round != round_nr:
+                best_description_in_round = get_best_description(utterances_in_current_round)
+                _caption_reprs[img_id_str].append(best_description_in_round)
+
+                current_round = round_nr
                 utterances_in_current_round = []
 
-            for game_id, round_nr, speaker, text in c:
-
-                if descriptions_as_captions and game_id != current_game:
-                    _caption_reprs = {k: v for (k, v) in caption_reprs.items()}
-                    current_game = game_id
-
-                if remove_stopwords:
-                    text = stopwords_filter(text)
-
-                try:
-                    # convert text to a bag-of-contextualised-words representations
-                    input_ids, utt_bow = text_to_bow(text, remove_stopwords, return_ids=True)
-                except TypeError:
-                    # as a result of stopwords filtering, the text may be empty
-                    continue
-
-                # compute recall score using BERTScore (Zhang et al. 2019)
-                R = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
-
-                if descriptions_as_captions:
-                    utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, R))
-
-                # new round
-                if descriptions_as_captions and current_round != round_nr:
-
-                    for utterance in utterances_in_current_round:
-
-                        if is_description(utterance):
-
-                            description = utterance[0]
-                            description_as_bow = utterance[2]
-
-                            description_tok_ids = utterance[1]
-                            input_tfs = [-1 for w in description_tok_ids]  # use dummy tf values
-
-                            _caption_reprs[img_id_str].append(tuple(zip(description, description_as_bow, input_tfs)))
-
-                    current_round = round_nr
-                    utterances_in_current_round = []
-
-                # store current utterance with score
-                new_c.append((game_id, round_nr, speaker, text, R))
-
-            # store current chain of utterances (with scores)
-            new_cs.append(new_c)
+            # store current utterance with score
+            new_c.append((game_id, round_nr, speaker, text, R))
 
         # store current image's chains_3feb (with scores)
-        chains_with_scores[img_path] = new_cs
+        chains_with_scores[img_path] += new_c
 
     return chains_with_scores
 
@@ -422,9 +427,6 @@ def main(output_path,
         with open('new_chains.dict', 'wb') as f:
             pickle.dump(all_chains, file=f)
 
-    print('END')
-    return
-
     if load_captions:
         with open('annotations/photobook_captions.dict', 'rb') as f:
             all_captions = pickle.load(f)
@@ -439,8 +441,6 @@ def main(output_path,
     if limit:
         random.shuffle(image_paths)
         image_paths = image_paths[:limit]
-        # with open('{}.imgids'.format(output_path), 'w') as f_out_paths:
-        #     print('\n'.join(image_paths), file=f_out_paths)
 
     # Obtain bag-of-contextualised-words representations for all captions
     # as well as image-specific smoothed (add-1) term frequencies
@@ -467,8 +467,8 @@ def main(output_path,
 
 
 if __name__ == '__main__':
-    model = AutoModel.from_pretrained('bert-base-cased')
-    tokenizer = AutoTokenizer.from_pretrained('bert-base-cased')
+    model = AutoModel.from_pretrained('bert-base-uncased')
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
     stopwords_en = set(stopwords.words('english'))
     stopwords_en |= {'see'}
@@ -484,8 +484,11 @@ if __name__ == '__main__':
     SEED = 0
     out_file_id = 3
 
-    main('chains_test.dict', whole_round=False, tf_weighting=False, remove_stopwords=False,
-         descriptions_as_captions=False, load_chains=False, load_captions=False, limit=LIMIT, seed=SEED)
+    # main('chains_test', whole_round=False, tf_weighting=False, remove_stopwords=False,
+    #      descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
+
+    main('chains_test_descr', whole_round=False, tf_weighting=False, remove_stopwords=False,
+         descriptions_as_captions=True, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
 
     # for whole in [False, True]:
     #
