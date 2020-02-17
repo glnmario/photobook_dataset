@@ -135,6 +135,7 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
     recognised_as_common = set()
     tot_messages = 0
     current_round_id = -1
+    current_game_id = -1
 
     end_indices = defaultdict(int)
 
@@ -142,6 +143,30 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
 
         # Collect fields of interest
         fields = {field: row[field] for field in F}
+
+        if fields['Game_ID'] != current_game_id:
+            recognised_as_common = set()
+            current_game_id = fields['Game_ID']
+
+        # Within round: store utterance
+        if fields['Message_Type'] == 'text':
+            tot_messages += 1
+            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
+            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text'], visual_context))
+
+        if fields['Message_Type'] == 'selection':
+            # parse selection: <com>/<dif> + img_id_str
+            _, selection, img_path = fields['Message_Text'].split(' ')
+
+            # a common image was selected as common by one of the speakers
+            if selection == '<com>' and img_path in fields['Round_Common']:
+                recognised_as_common.add(img_path)
+                if not whole_round:
+                    end_indices[img_path] = len(buffer)
+
+            if selection == '<dif>' and img_path in recognised_as_common:
+                if not whole_round:
+                    end_indices[img_path] = len(buffer)
 
         # New round!
         if fields['Round_Nr'] != current_round_id:
@@ -160,29 +185,6 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
             buffer = []
             end_indices = defaultdict(int)
             current_round_id = fields['Round_Nr']
-
-        # Within round: store utterance
-        if fields['Message_Type'] == 'text':
-            tot_messages += 1
-            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
-            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text'], visual_context))
-
-        if fields['Message_Type'] == 'selection':
-            # parse selection: <com>/<dif> + img_id_str
-            _, selection, img_path = fields['Message_Text'].split(' ')
-
-            # a common image was selected as common by one of the speakers
-            if selection == '<com>' and img_path in fields['Round_Common']:
-                recognised_as_common.add(img_path)
-
-                if not whole_round:
-                    end_indices[img_path] = len(buffer)
-
-            if selection == '<dif>' and img_path in recognised_as_common:
-                recognised_as_common.add(img_path)
-
-                if not whole_round:
-                    end_indices[img_path] = len(buffer)
 
     return chains
 
@@ -272,6 +274,8 @@ def vg_score(text, img_path, vg_attributes, vg_relations, visual_context):
     target_attributes = vg_attributes[img_path]
     target_relations = vg_relations[img_path]
 
+    all_features = target_attributes | target_relations
+
     visual_context -= {img_path}
 
     confounding_attributes = set()
@@ -283,10 +287,10 @@ def vg_score(text, img_path, vg_attributes, vg_relations, visual_context):
     discriminative_attributes = target_attributes - confounding_attributes
     discriminative_relations = target_relations - confounding_relations
 
-    meteor_att = meteor(' '.join(discriminative_attributes), text, gamma=0)
-    meteor_rel = meteor(' '.join(discriminative_relations), text, gamma=0)
+    discriminative_features = discriminative_attributes | discriminative_relations
+    meteor_score = meteor(' '.join(discriminative_features), text, gamma=0)
 
-    return meteor_att, meteor_rel
+    return meteor_score, discriminative_features, all_features
 
 
 def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stopwords, descriptions_as_captions, vg_attributes=None, vg_relations=None):
@@ -330,10 +334,14 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
             # compute recall using BERTScore (Zhang et al. 2019)
             score = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
 
+            discriminative_features, all_features = {}, {}
             if use_vg:
                 # compute METEOR using Visual Genome annotations
-                meteor_att, meteor_rel = vg_score(text, img_path, vg_attributes, vg_relations, vis_context)
-                score += meteor_att + meteor_rel
+                meteor_score, discriminative_features, all_features = vg_score(text, img_path,
+                                                                               vg_attributes,
+                                                                               vg_relations,
+                                                                               vis_context)
+                score = score * (1 + meteor_score)
 
             if descriptions_as_captions:
                 utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, score))
@@ -351,7 +359,7 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 utterances_in_current_round = []
 
             # store current utterance with score
-            new_c.append((game_id, round_nr, speaker, text, score))
+            new_c.append((game_id, round_nr, speaker, text, score, discriminative_features, all_features))
 
         # store current image's chains_3feb (with scores)
         chains_with_scores[img_path] += new_c
@@ -463,7 +471,7 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
     stopwords_en = set(stopwords.words('english'))
-    stopwords_en |= {'see'}
+    stopwords_en |= {'see', 'sorry', 'yes', 'no', 'nope', 'oh', 'got', 'this', 'that'}
     stopwords_en -= {'above', 'against', 'below', 'between', 'down', 'further', 'in', 'into', 'off', 'on', 'out',
                      'over', 'through', 'under', 'up'}
 
@@ -472,14 +480,14 @@ if __name__ == '__main__':
     #          load_chains=True, load_captions=True, limit=None,
     #          seed=33):
 
-    LIMIT = 3
-    SEED = 0
+    LIMIT = 10
+    SEED = 10
     out_file_id = 3
 
-    main('chains_test_novg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=False,
+    main('chains_test_novg_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=False,
          descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
 
-    main('chains_test_vg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=True,
+    main('chains_test_vg_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=True,
          descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
 
     # for whole in [False, True]:
