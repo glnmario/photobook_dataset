@@ -10,27 +10,27 @@ from tqdm import tqdm
 from processor import Log
 from copy import deepcopy
 from collections import defaultdict, Counter
-from transformers import AutoModel, AutoTokenizer
+from transformers import BertModel, BertTokenizer
 # from nltk.corpus import stopwords
 from spacy.lang.en import stop_words
 from nltk.translate.meteor_score import single_meteor_score as meteor
 
 
 def collect_dataset(logs):
-    labels = ["Game_ID", "Game_Domain_ID", "Game_Domain_1", "Game_Domain_2", \
-              "Feedback_A", "Feedback_B", 'Agent_1', "Agent_2", \
-              "Round_Nr", "Round_Images_A", "Round_Images_B", \
-              "Round_Common", "Round_Highlighted_A", "Round_Highlighted_B", \
-              "Message_Nr", "Message_Timestamp", "Message_Turn", "Message_Agent_ID", \
-              "Message_Speaker", "Message_Type", "Message_Text", "Message_Referent"]
+    labels = ['Game_ID', 'Game_Domain_ID', 'Game_Domain_1', 'Game_Domain_2', \
+              'Feedback_A', 'Feedback_B', 'Agent_1', 'Agent_2', \
+              'Round_Nr', 'Round_Images_A', 'Round_Images_B', \
+              'Round_Common', 'Round_Highlighted_A', 'Round_Highlighted_B', \
+              'Message_Nr', 'Message_Timestamp', 'Message_Turn', 'Message_Agent_ID', \
+              'Message_Speaker', 'Message_Type', 'Message_Text', 'Message_Referent']
     dataset = []
     for game_id, log in logs.items():
         game_data = [game_id, log.domain_id, log.domains[0], log.domains[1],
-                     log.feedback["A"], log.feedback["B"], log.agent_ids[0], log.agent_ids[1]]
+                     log.feedback['A'], log.feedback['B'], log.agent_ids[0], log.agent_ids[1]]
         for game_round in log.rounds:
             round_data = [game_round.round_nr - 1,
-                          game_round.images["A"], game_round.images["B"], game_round.common,
-                          game_round.highlighted["A"], game_round.highlighted["B"]]
+                          game_round.images['A'], game_round.images['B'], game_round.common,
+                          game_round.highlighted['A'], game_round.highlighted['B']]
             for message in game_round.messages:
                 message_data = [message.message_id, message.timestamp, message.turn, message.agent_id, \
                                 message.speaker, message.type, message.text, message.referent]
@@ -107,9 +107,6 @@ def stopwords_filter(text):
 def chains_from_game_logs(logs, whole_round):
     dataset = collect_dataset(logs)
 
-    F = ['Game_ID', 'Round_Nr', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text', 'Round_Common',
-         'Round_Images_A', 'Round_Images_B', 'Message_Referent']
-
     chains = defaultdict(list)
     buffer = []
     recognised_as_common = set()
@@ -122,7 +119,7 @@ def chains_from_game_logs(logs, whole_round):
     for index, row in tqdm(dataset.iterrows(), total=len(dataset)):
 
         # Collect fields of interest
-        fields = {field: row[field] for field in F}
+        fields = {field: row[field] for field in FIELDS}
 
         # New round!
         if (fields['Round_Nr'] != current_round_id) and buffer:
@@ -130,9 +127,10 @@ def chains_from_game_logs(logs, whole_round):
             # 1. store utterances from previous round
             for im in recognised_as_common:
                 extended_buffer = []
-                for tupl_idx, tupl in enumerate(buffer):
-                    in_segment = whole_round or tupl_idx < end_indices[im]
-                    extended_buffer.append(tupl + (in_segment,))
+                for _idx, buffer_fields in enumerate(buffer):
+                    in_segment = whole_round or _idx < end_indices[im]
+                    buffer_fields['in_segment'] = in_segment
+                    extended_buffer.append(buffer_fields)
 
                 chains[im] += extended_buffer
 
@@ -162,9 +160,7 @@ def chains_from_game_logs(logs, whole_round):
         # Within round: store utterance
         if fields['Message_Type'] == 'text':
             tot_messages += 1
-            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
-            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Nr'], fields['Message_Speaker'],
-                           fields['Message_Text'], fields['Message_Referent'], visual_context))
+            buffer.append(fields)
 
     return chains
 
@@ -194,7 +190,7 @@ def preprocess_captions(image_paths, captions, remove_stopwords):
             #     caption = caption[:-1]
 
             # tokenise caption
-            caption = ' '.join(spacy_tokenizer(caption))
+            caption = ' '.join([tok.text for tok in spacy_tokenizer(caption)])
 
             if remove_stopwords:
                 caption = stopwords_filter(caption)
@@ -216,7 +212,7 @@ def preprocess_captions(image_paths, captions, remove_stopwords):
             #     caption = caption[:-1]
 
             # tokenise caption
-            caption = ' '.join(spacy_tokenizer(caption))
+            caption = ' '.join([tok.text for tok in spacy_tokenizer(caption)])
 
             if remove_stopwords:
                 caption = stopwords_filter(caption)
@@ -300,18 +296,18 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
             utterances_in_current_round = []
 
         new_c = []
-        for game_id, round_nr, msg_nr, speaker, text, referent, vis_context, in_segment in chains[img_path]:
-
-            if descriptions_as_captions and game_id != current_game:
+        for fields in chains[img_path]:
+            if descriptions_as_captions and fields['Game_ID'] != current_game:
                 _caption_reprs = deepcopy(caption_reprs)
-                current_game = game_id
-                current_round = round_nr
+                current_game = fields['Game_ID']
+                current_round = fields['Round_Nr']
 
-            # tokenise text
-            text = ' '.join(spacy_tokenizer(text))
-
+            # preprocess text
+            text = ' '.join([tok.text for tok in spacy_tokenizer(fields['Message_Text'])])
             if remove_stopwords:
                 text = stopwords_filter(text)
+
+            fields['text'] = text
 
             try:
                 # convert text to a bag-of-contextualised-words representations
@@ -320,40 +316,44 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 # as a result of stopwords filtering, the text may be empty
                 continue
 
-            if in_segment:
+            discriminative_features, all_features = {}, {}
+            if fields['in_segment']:
                 # compute recall using BERTScore (Zhang et al. 2019)
-                score = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
+                bert_score = mean_bert_recall(utt_bow, _caption_reprs[img_id_str], tf=False)
 
-                discriminative_features, all_features = {}, {}
                 if use_vg:
+                    visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
+
                     # compute METEOR using Visual Genome annotations
                     meteor_score, discriminative_features, all_features = vg_score(text, img_path,
                                                                                    vg_attributes,
                                                                                    vg_relations,
-                                                                                   vis_context)
-                    # score = score * (1 + meteor_score)
-                    score = score + meteor_score
+                                                                                   visual_context)
+                    # score = bert_score * (1 + meteor_score)
+                    fields['score'] = bert_score + meteor_score
             else:
-                score = -1
+                fields['score'] = -1
+
+            fields['discriminative_features'] = discriminative_features
+            fields['all_features'] = all_features
 
             if descriptions_as_captions:
-                utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, score))
+                utterances_in_current_round.append((text, input_ids[0][1:-1].numpy(), utt_bow, fields['score']))
 
             # base case - first iteration
             if descriptions_as_captions and current_round == -1:
-                current_round = round_nr
+                current_round = fields['Round_Nr']
 
             # new round
-            if descriptions_as_captions and current_round != round_nr:
+            if descriptions_as_captions and current_round != fields['Round_Nr']:
                 best_description_in_round = get_best_description(utterances_in_current_round)
                 _caption_reprs[img_id_str].append(best_description_in_round)
 
-                current_round = round_nr
+                current_round = fields['Round_Nr']
                 utterances_in_current_round = []
 
             # store current utterance with score
-            new_c.append(
-                (game_id, round_nr, msg_nr, speaker, text, score, discriminative_features, all_features, referent))
+            new_c.append(fields)
 
         # store current image's chains_3feb (with scores)
         chains_with_scores[img_path] += new_c
@@ -454,9 +454,14 @@ def main(output_path,
 
 
 if __name__ == '__main__':
-    model = AutoModel.from_pretrained('bert-base-uncased')
-    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-    spacy_tokenizer = spacy.load("en_core_web_sm")
+    model = BertModel.from_pretrained('bert-base-uncased')
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    # # Because of new error with transformers 2.5.0
+    # tokenizer.pad_token = '<PAD>'
+    # model.resize_token_embeddings(len(tokenizer))
+
+    spacy_tokenizer = spacy.load('en_core_web_sm')
 
     stopwords_en = stop_words.STOP_WORDS
     stopwords_en |= {'sorry', 'noo', 'nope', 'oh', 'got'}
@@ -473,6 +478,13 @@ if __name__ == '__main__':
     # stopwords_en |= {'sorry', 'yes', 'no', 'noo', 'nope', 'oh', 'got', 'this', 'that'}
     # stopwords_en -= {'above', 'against', 'below', 'between', 'down', 'further', 'in', 'into', 'off', 'on', 'out',
     #                  'over', 'through', 'under', 'up'}
+
+    FIELDS = ['Game_ID', 'Round_Nr', 'Message_Nr', 'Message_Speaker', 'Message_Type', 'Message_Text', 'Round_Common',
+              'Round_Images_A', 'Round_Images_B', 'Message_Referent', 'Game_Domain_ID', 'Game_Domain_1',
+              'Game_Domain_2', 'Feedback_A', 'Feedback_B', 'Agent_1', 'Agent_2', 'Round_Highlighted_A',
+              'Round_Highlighted_B', 'Message_Timestamp', 'Message_Turn', 'Message_Agent_ID']
+
+    F2I = {f: i for i, f in enumerate(FIELDS)}
 
     LIMIT = None
     SEED = 0
@@ -495,5 +507,5 @@ if __name__ == '__main__':
     # main('chains_test_vg_nostopwords_descr', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=True,
     #      descriptions_as_captions=True, load_captions=True, limit=LIMIT, seed=SEED)
 
-    main('chains_valid_vg_sum', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=True,
+    main('chains_valid_vg_sum_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=True,
          descriptions_as_captions=False, load_captions=True, limit=LIMIT, seed=SEED)
