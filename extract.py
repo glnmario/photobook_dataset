@@ -144,15 +144,26 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
         # Collect fields of interest
         fields = {field: row[field] for field in F}
 
+        # New round!
+        if (fields['Round_Nr'] != current_round_id) and buffer:
+
+            # 1. store utterances from previous round
+            for im in recognised_as_common:
+                if whole_round:
+                    segment = buffer
+                else:
+                    segment = buffer[:end_indices[im]]
+
+                chains[im] += segment
+
+            # 2. reset and update
+            buffer = []
+            end_indices = defaultdict(int)
+            current_round_id = fields['Round_Nr']
+
         if fields['Game_ID'] != current_game_id:
             recognised_as_common = set()
             current_game_id = fields['Game_ID']
-
-        # Within round: store utterance
-        if fields['Message_Type'] == 'text':
-            tot_messages += 1
-            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
-            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Speaker'], fields['Message_Text'], visual_context))
 
         if fields['Message_Type'] == 'selection':
             # parse selection: <com>/<dif> + img_id_str
@@ -168,23 +179,12 @@ def chains_from_game_logs(whole_round, data_path='', logs_folder='logs'):
                 if not whole_round:
                     end_indices[img_path] = len(buffer)
 
-        # New round!
-        if fields['Round_Nr'] != current_round_id:
-
-            # 1. store utterances from previous round
-            if buffer:
-                for im in recognised_as_common:
-                    if whole_round:
-                        segment = buffer
-                    else:
-                        segment = buffer[:end_indices[im]]
-
-                    chains[im] += segment
-
-            # 2. reset and update
-            buffer = []
-            end_indices = defaultdict(int)
-            current_round_id = fields['Round_Nr']
+        # Within round: store utterance
+        if fields['Message_Type'] == 'text':
+            tot_messages += 1
+            visual_context = set(fields['Round_Images_A']) | set(fields['Round_Images_B'])
+            buffer.append((fields['Game_ID'], fields['Round_Nr'], fields['Message_Nr'], fields['Message_Speaker'],
+                           fields['Message_Text'], visual_context))
 
     return chains
 
@@ -314,7 +314,7 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
             utterances_in_current_round = []
 
         new_c = []
-        for game_id, round_nr, speaker, text, vis_context in chains[img_path]:
+        for game_id, round_nr, msg_nr, speaker, text, vis_context in chains[img_path]:
 
             if descriptions_as_captions and game_id != current_game:
                 _caption_reprs = deepcopy(caption_reprs)
@@ -359,7 +359,7 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 utterances_in_current_round = []
 
             # store current utterance with score
-            new_c.append((game_id, round_nr, speaker, text, score, discriminative_features, all_features))
+            new_c.append((game_id, round_nr, msg_nr, speaker, text, score, discriminative_features, all_features))
 
         # store current image's chains_3feb (with scores)
         chains_with_scores[img_path] += new_c
@@ -480,15 +480,24 @@ if __name__ == '__main__':
     #          load_chains=True, load_captions=True, limit=None,
     #          seed=33):
 
-    LIMIT = 10
+    LIMIT = 5
     SEED = 10
     out_file_id = 3
 
-    main('chains_test_novg_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=False,
-         descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
+    # main('chains_test_novg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=False,
+    # descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
+
+    # main('chains_test_novg_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=False,
+         # descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
+
+    # main('chains_test_vg', whole_round=False, tf_weighting=False, remove_stopwords=False, use_vg=True,
+    #      descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
 
     main('chains_test_vg_nostopwords', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=True,
-         descriptions_as_captions=False, load_chains=True, load_captions=True, limit=LIMIT, seed=SEED)
+         descriptions_as_captions=False, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
+
+    # main('chains_test_vg_nostopwords_descr', whole_round=False, tf_weighting=False, remove_stopwords=True, use_vg=True,
+    #      descriptions_as_captions=True, load_chains=False, load_captions=True, limit=LIMIT, seed=SEED)
 
     # for whole in [False, True]:
     #
