@@ -3,6 +3,7 @@ import json
 import pickle
 import random
 import torch
+import spacy
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -188,9 +189,12 @@ def preprocess_captions(image_paths, captions, remove_stopwords):
         # 2. collect word frequencies
         for caption in captions[img_id_str]:
 
-            # remove trailing period
-            if caption[-1] == '.':
-                caption = caption[:-1]
+            # # remove trailing period
+            # if caption[-1] == '.':
+            #     caption = caption[:-1]
+
+            # tokenise caption
+            caption = ' '.join(spacy_tokenizer(caption))
 
             if remove_stopwords:
                 caption = stopwords_filter(caption)
@@ -207,9 +211,12 @@ def preprocess_captions(image_paths, captions, remove_stopwords):
         # -----------------------------------------------------------------------------------
         for caption in captions[img_id_str]:
 
-            # remove trailing period
-            if caption[-1] == '.':
-                caption = caption[:-1]
+            # # remove trailing period
+            # if caption[-1] == '.':
+            #     caption = caption[:-1]
+
+            # tokenise caption
+            caption = ' '.join(spacy_tokenizer(caption))
 
             if remove_stopwords:
                 caption = stopwords_filter(caption)
@@ -299,6 +306,9 @@ def chains_with_utterance_scores(image_paths, chains, caption_reprs, remove_stop
                 _caption_reprs = deepcopy(caption_reprs)
                 current_game = game_id
                 current_round = round_nr
+
+            # tokenise text
+            text = ' '.join(spacy_tokenizer(text))
 
             if remove_stopwords:
                 text = stopwords_filter(text)
@@ -446,6 +456,7 @@ def main(output_path,
 if __name__ == '__main__':
     model = AutoModel.from_pretrained('bert-base-uncased')
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    spacy_tokenizer = spacy.load("en_core_web_sm")
 
     stopwords_en = stop_words.STOP_WORDS
     stopwords_en |= {'sorry', 'noo', 'nope', 'oh', 'got'}
